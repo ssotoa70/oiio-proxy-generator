@@ -1,6 +1,6 @@
 FROM oiio-proxy-generator:latest
 
-ENV LD_LIBRARY_PATH="/layers/paketo-buildpacks_cpython/cpython/lib:/layers/apt-buildpack/apt/lib/x86_64-linux-gnu:/layers/apt-buildpack/apt/usr/lib/x86_64-linux-gnu:/layers/apt-buildpack/apt/usr/lib:/layers/apt-buildpack/apt/usr/lib/x86_64-linux-gnu/pulseaudio"
+ENV LD_LIBRARY_PATH="/layers/paketo-buildpacks_cpython/cpython/lib:/layers/apt-buildpack/apt/lib/x86_64-linux-gnu:/layers/apt-buildpack/apt/usr/lib/x86_64-linux-gnu:/layers/apt-buildpack/apt/usr/lib"
 ENV PATH="/layers/apt-buildpack/apt/usr/bin:/layers/paketo-buildpacks_cpython/cpython/bin:${PATH}"
 ENV PYTHONPATH="/workspace:/layers/paketo-buildpacks_cpython/cpython/lib/python3.12/site-packages:/layers/paketo-buildpacks_pip-install/packages/lib/python3.12/site-packages"
 

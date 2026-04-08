@@ -63,7 +63,7 @@ def _get_schema() -> "pa.Schema":
         ("source_size_bytes", pa.int64()),      # Original source file size
         ("source_colorspace", pa.string()),     # Detected source color space
         ("thumb_colorspace", pa.string()),      # Target: sRGB
-        ("proxy_colorspace", pa.string()),      # Target: Rec.709
+        ("proxy_colorspace", pa.string()),      # Target: Rec709 (or display-referred)
         ("thumb_resolution", pa.string()),      # "256x256"
         ("proxy_resolution", pa.string()),      # "1920x1080"
         ("processing_time_seconds", pa.float64()),  # Total processing time
