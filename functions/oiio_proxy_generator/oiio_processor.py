@@ -67,6 +67,7 @@ class OiioProcessor:
         ffmpeg_cmd = [
             "ffmpeg", "-y",
             "-i", intermediate,
+            "-an",
             "-c:v", "libx264",
             "-preset", "fast",
             "-crf", "23",
