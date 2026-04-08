@@ -1,12 +1,12 @@
 FROM oiio-proxy-generator:latest
 
-ENV LD_LIBRARY_PATH="/layers/paketo-buildpacks_cpython/cpython/lib:/layers/apt-buildpack/apt/lib/x86_64-linux-gnu:/layers/apt-buildpack/apt/usr/lib/x86_64-linux-gnu"
-ENV PATH="/layers/paketo-buildpacks_cpython/cpython/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/layers/paketo-buildpacks_cpython/cpython/lib:/layers/apt-buildpack/apt/lib/x86_64-linux-gnu:/layers/apt-buildpack/apt/usr/lib/x86_64-linux-gnu:/layers/apt-buildpack/apt/usr/lib"
+ENV PATH="/layers/apt-buildpack/apt/usr/bin:/layers/paketo-buildpacks_cpython/cpython/bin:${PATH}"
 ENV PYTHONPATH="/workspace:/layers/paketo-buildpacks_cpython/cpython/lib/python3.12/site-packages:/layers/paketo-buildpacks_pip-install/packages/lib/python3.12/site-packages"
 
-# OCIO config path (ACES 1.3 from system package)
-ENV OCIO="/usr/share/color/opencolorio/aces_1.3/config.ocio"
-ENV OCIO_CONFIG_PATH="/usr/share/color/opencolorio/aces_1.3/config.ocio"
+# OCIO config: not set by default. oiiotool uses built-in color transforms
+# (linear, sRGB, Rec709). Set OCIO_CONFIG_PATH in pipeline env vars to use
+# a custom OCIO config (e.g., ACES 1.3) if available on the cluster.
 
 WORKDIR /workspace
 

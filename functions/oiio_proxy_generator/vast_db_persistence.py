@@ -266,7 +266,7 @@ def persist_proxy_to_vast_database(
                 "source_size_bytes": [source_size_bytes],
                 "source_colorspace": [source_colorspace],
                 "thumb_colorspace": ["sRGB"],
-                "proxy_colorspace": ["Rec.709"],
+                "proxy_colorspace": ["Rec709"],
                 "thumb_resolution": ["256x256"],
                 "proxy_resolution": ["1920x1080"],
                 "processing_time_seconds": [processing_time_seconds],

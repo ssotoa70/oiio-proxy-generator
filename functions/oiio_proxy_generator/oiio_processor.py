@@ -1,7 +1,10 @@
 """OpenImageIO processor for thumbnail and proxy generation.
 
 Wraps oiiotool CLI for image resize operations and ffmpeg for H.264 encoding.
-All paths are validated before subprocess execution.
+
+Thumbnail pipeline: oiiotool resize -> JPEG (quality 85)
+Proxy pipeline:     oiiotool resize -> PNG intermediate -> ffmpeg H.264 MP4
+                    with -movflags +faststart for browser streaming
 """
 
 import os
@@ -26,24 +29,41 @@ class OiioProcessor:
         """Generate a JPEG thumbnail from an EXR/DPX source."""
         if not Path(source).exists():
             raise OiioError(f"Source file not found: {source}")
-        cmd = self._build_thumbnail_cmd(source, output, width, height)
+        cmd = [
+            self.oiiotool_bin,
+            source,
+            "--resize", f"{width}x{height}",
+            "--compression", "jpeg:85",
+            "-o", output,
+        ]
         self._run(cmd)
 
     def generate_proxy(self, source: str, output: str, width: int = 1920, height: int = 1080) -> None:
         """Generate an H.264 proxy MP4 from an EXR/DPX source.
 
-        Uses oiiotool to resize to PNG intermediate, then ffmpeg to encode H.264.
+        Two-step process:
+        1. oiiotool resizes to PNG intermediate
+        2. ffmpeg encodes to H.264 with -movflags +faststart for browser streaming
         """
         if not Path(source).exists():
             raise OiioError(f"Source file not found: {source}")
         if not shutil.which("ffmpeg"):
             raise OiioError("ffmpeg not found in PATH -- required for proxy encoding")
 
-        # Convert to PNG intermediate, then encode with ffmpeg
+        # Step 1: oiiotool resize to PNG intermediate
         intermediate = output.replace(".mp4", "_intermediate.png")
-        resize_cmd = self._build_thumbnail_cmd(source, intermediate, width, height)
+        resize_cmd = [
+            self.oiiotool_bin,
+            source,
+            "--resize", f"{width}x{height}",
+            "-o", intermediate,
+        ]
         self._run(resize_cmd)
 
+        # Step 2: ffmpeg encode to H.264 MP4
+        # -movflags +faststart: moves moov atom to start for browser streaming
+        # -pix_fmt yuv420p: required for browser compatibility
+        # -preset fast: balance between speed and compression
         ffmpeg_cmd = [
             "ffmpeg", "-y",
             "-i", intermediate,
@@ -51,19 +71,11 @@ class OiioProcessor:
             "-preset", "fast",
             "-crf", "23",
             "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
             output,
         ]
         self._run(ffmpeg_cmd)
         Path(intermediate).unlink(missing_ok=True)
-
-    def _build_thumbnail_cmd(self, source: str, output: str, width: int, height: int) -> list[str]:
-        return [
-            self.oiiotool_bin,
-            source,
-            "--resize", f"{width}x{height}",
-            "--compression", "jpeg:85",
-            "-o", output,
-        ]
 
     def _run(self, cmd: list[str]) -> None:
         timeout = int(os.environ.get("OIIO_TIMEOUT", "300"))

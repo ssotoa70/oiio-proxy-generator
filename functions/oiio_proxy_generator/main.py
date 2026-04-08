@@ -1,38 +1,38 @@
 """VAST DataEngine handler for oiio-proxy-generator.
 
-Triggered by Element.ObjectCreated events on a VAST S3 bucket. Generates
-thumbnails and proxies using OpenImageIO with OCIO color transforms, and
-persists results to VAST DataBase.
+Triggered by Element.ObjectCreated events on a VAST S3 bucket. Downloads
+source EXR/DPX files via S3, generates color-correct thumbnails and review
+proxies, uploads outputs back to S3, persists metadata to VAST DataBase,
+and publishes completion events to Kafka.
 
-Supports two I/O modes controlled by the NFS_MOUNT_PATH env var:
+Output path convention:
+  Source:    s3://bucket/renders/shot_010/beauty.0001.exr
+  Thumbnail: s3://bucket/renders/shot_010/.proxies/beauty.0001_thumb.jpg
+  Proxy:     s3://bucket/renders/shot_010/.proxies/beauty.0001_proxy.mp4
 
-  NFS mode (NFS_MOUNT_PATH set):
-    Source read directly from NFS mount -- no S3 download.
-    Outputs written to NFS -- no S3 upload.
-    OCIO intermediates also on NFS. Fastest path.
+The .proxies/ subdirectory is a sibling of the source file. Outputs are
+tagged with ContentType and S3 tags for browser delivery and VAST Catalog.
 
-  S3 mode (NFS_MOUNT_PATH unset):
-    Source downloaded via boto3 to /tmp.
-    Outputs uploaded back to S3 after generation.
-    Requires ephemeral disk for all intermediates.
+Color pipeline (oiiotool built-in, no OCIO config required):
+  Thumbnail: source -> colorconvert linear sRGB -> resize 256x256 -> JPEG
+  Proxy:     source -> colorconvert linear Rec709 -> resize 1920x1080 -> H.264 MP4
 
 Event flow:
-  ElementTrigger -> VastEvent with elementpath -> bucket/object_key
-  NFS_MOUNT_PATH -> derive local path: {NFS_MOUNT_PATH}/{bucket}/{key}
-  S3 credentials -> fallback when NFS not available
+  ElementTrigger (.exr/.dpx suffix) -> VastEvent -> handler
+  -> S3 GET source -> generate thumb + proxy -> S3 PUT outputs
+  -> VastDB INSERT proxy_outputs -> Kafka publish proxy.generated
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 try:
     import boto3
@@ -115,13 +115,6 @@ def init(ctx):
     except Exception as exc:
         ctx.logger.error("VastDB init failed (will retry per-event): %s", exc)
 
-    # --- I/O mode ---
-    nfs_mount = os.environ.get("NFS_MOUNT_PATH", "")
-    if nfs_mount:
-        ctx.logger.info("I/O mode: NFS (mount=%s)", nfs_mount)
-    else:
-        ctx.logger.info("I/O mode: S3 (set NFS_MOUNT_PATH to use direct NFS)")
-
     ctx.logger.info("oiiotool: %s", "available" if _check_tool("oiiotool") else "NOT AVAILABLE")
     ctx.logger.info("ffmpeg: %s", "available" if _check_tool("ffmpeg") else "NOT AVAILABLE")
     ctx.logger.info("OIIO-PROXY-GENERATOR initialized successfully")
@@ -132,21 +125,15 @@ def handler(ctx, event):
     """Primary DataEngine function handler.
 
     Receives VastEvent objects from DataEngine element triggers.
-    For Element events, extracts bucket/key from the elementpath extension.
-    Downloads the file via the global S3 client, generates thumbnail and proxy,
-    and persists results to VAST DataBase.
-
-    Args:
-        ctx: VAST function context with logger
-        event: VastEvent object (ElementTriggerVastEvent, etc.)
+    Downloads the source file via S3, generates thumbnail and proxy,
+    uploads outputs back to S3 with proper ContentType and tags,
+    persists metadata to VastDB, and publishes Kafka event.
     """
     ctx.logger.info("=" * 80)
     ctx.logger.info("Processing new proxy generation request")
 
-    # Log event metadata
     ctx.logger.info("Event ID: %s", event.id)
     ctx.logger.info("Event Type: %s", event.type)
-    ctx.logger.info("Event Subtype: %s", event.subtype if event.subtype else "None")
 
     # Extract file location from event
     s3_bucket = None
@@ -157,19 +144,13 @@ def handler(ctx, event):
             element_event = event.as_element_event()
             s3_bucket = element_event.bucket
             s3_key = element_event.object_key
-
-            ctx.logger.info("Element event - Trigger: %s, ID: %s",
-                            event.trigger, event.trigger_id)
-            ctx.logger.info("Element path: %s",
-                            element_event.extensions.get("elementpath"))
-            ctx.logger.info("Bucket: %s, Key: %s", s3_bucket, s3_key)
+            ctx.logger.info("Element: s3://%s/%s", s3_bucket, s3_key)
         except Exception as exc:
             ctx.logger.warning("Failed to extract Element properties: %s", exc)
 
     # Fallback: check data payload
     if not s3_bucket or not s3_key:
         event_data = event.get_data() if hasattr(event, "get_data") else {}
-        ctx.logger.info("Using data payload: %s", json.dumps(event_data, indent=2))
         s3_bucket = event_data.get("s3_bucket")
         s3_key = event_data.get("s3_key")
 
@@ -177,80 +158,62 @@ def handler(ctx, event):
         ctx.logger.error("Missing S3 bucket/key in event")
         return _error_result("Missing S3 bucket/key - cannot locate source file")
 
-    # Validate extension
+    # Validate extension (also prevents infinite loops from .jpg/.mp4 outputs)
     if not _is_supported_extension(s3_key):
         ctx.logger.info("Skipping unsupported file: %s", s3_key)
         return _error_result(f"Unsupported file extension: {s3_key}")
 
-    # Resolve I/O mode: NFS direct (with S3 fallback) or S3 only
-    nfs_mount = os.environ.get("NFS_MOUNT_PATH", "")
-    use_nfs = False
     dev_mode = os.environ.get("DEV_MODE", "false").lower() == "true"
 
-    # Process the file
+    # All temp files tracked for cleanup
     source_path = None
     thumb_path = None
     proxy_path = None
-    _s3_downloaded = False  # Track whether we need to clean up a downloaded file
+    ocio_intermediates = []
     try:
         start_time = time.monotonic()
         asset_id = _derive_asset_id(s3_key)
         thumb_s3_key = _derive_output_key(s3_key, "_thumb.jpg")
         proxy_s3_key = _derive_output_key(s3_key, "_proxy.mp4")
 
-        # Try NFS first if configured, fall back to S3 if unavailable
-        if nfs_mount:
-            nfs_source = _nfs_path(nfs_mount, s3_bucket, s3_key)
-            if Path(nfs_source).exists():
-                use_nfs = True
-                source_path = nfs_source
-                source_size = Path(source_path).stat().st_size
+        # Download source from S3
+        source_path, s3_file_info = _download_from_s3(ctx, s3_bucket, s3_key)
+        source_size = s3_file_info["size_bytes"]
+        ctx.logger.info("Downloaded %s (%d bytes)", s3_key, source_size)
 
-                # Output paths on NFS (visible via S3 immediately)
-                thumb_path = _nfs_path(nfs_mount, s3_bucket, thumb_s3_key)
-                proxy_path = _nfs_path(nfs_mount, s3_bucket, proxy_s3_key)
-                Path(thumb_path).parent.mkdir(parents=True, exist_ok=True)
+        # Set up temp output paths
+        thumb_path = tempfile.mktemp(suffix="_thumb.jpg", prefix=f"{asset_id}_")
+        proxy_path = tempfile.mktemp(suffix="_proxy.mp4", prefix=f"{asset_id}_")
 
-                ctx.logger.info("NFS mode: source=%s (%d bytes)", source_path, source_size)
-            else:
-                ctx.logger.warning(
-                    "NFS path not accessible: %s -- falling back to S3", nfs_source)
-
-        if not use_nfs:
-            # S3 mode: download to /tmp, upload results after
-            source_path, s3_file_info = _download_from_s3(ctx, s3_bucket, s3_key)
-            _s3_downloaded = True
-            source_size = s3_file_info["size_bytes"]
-            ctx.logger.info("S3 mode: downloaded %s (%d bytes)", s3_key, source_size)
-
-            thumb_path = tempfile.mktemp(suffix="_thumb.jpg", prefix=f"{asset_id}_")
-            proxy_path = tempfile.mktemp(suffix="_proxy.mp4", prefix=f"{asset_id}_")
-
-        # Configure OCIO and OIIO
-        processor = OiioProcessor()
+        # Configure color transform
         transform = OcioTransform(
             config_path=os.environ.get("OCIO_CONFIG_PATH"),
             dev_mode=dev_mode,
         )
+        processor = OiioProcessor()
 
-        # Step 1: OCIO transform to sRGB -> generate thumbnail
+        # Step 1: Color transform to sRGB -> generate thumbnail
         transformed_for_thumb = transform.apply(source_path, target_colorspace="sRGB")
+        if transformed_for_thumb != source_path:
+            ocio_intermediates.append(transformed_for_thumb)
         processor.generate_thumbnail(transformed_for_thumb, thumb_path, width=256, height=256)
-        ctx.logger.info("Thumbnail generated: %s", thumb_path)
+        ctx.logger.info("Thumbnail generated (%d bytes)", Path(thumb_path).stat().st_size)
 
-        # Step 2: OCIO transform to Rec.709 -> generate proxy
-        transformed_for_proxy = transform.apply(source_path, target_colorspace="Rec.709")
+        # Step 2: Color transform to Rec709 -> generate proxy
+        transformed_for_proxy = transform.apply(source_path, target_colorspace="Rec709")
+        if transformed_for_proxy != source_path:
+            ocio_intermediates.append(transformed_for_proxy)
         processor.generate_proxy(transformed_for_proxy, proxy_path, width=1920, height=1080)
-        ctx.logger.info("Proxy generated: %s", proxy_path)
+        ctx.logger.info("Proxy generated (%d bytes)", Path(proxy_path).stat().st_size)
 
         # Measure output sizes
-        thumb_size = Path(thumb_path).stat().st_size if Path(thumb_path).exists() else 0
-        proxy_size = Path(proxy_path).stat().st_size if Path(proxy_path).exists() else 0
+        thumb_size = Path(thumb_path).stat().st_size
+        proxy_size = Path(proxy_path).stat().st_size
 
-        # S3 mode only: upload outputs
-        if not use_nfs and s3_client and not dev_mode:
-            _upload_to_s3(ctx, s3_bucket, thumb_s3_key, thumb_path)
-            _upload_to_s3(ctx, s3_bucket, proxy_s3_key, proxy_path)
+        # Upload outputs to S3 with ContentType and tags
+        if s3_client and not dev_mode:
+            _upload_to_s3(ctx, s3_bucket, thumb_s3_key, thumb_path, media_type="thumbnail")
+            _upload_to_s3(ctx, s3_bucket, proxy_s3_key, proxy_path, media_type="proxy")
 
         elapsed = time.monotonic() - start_time
 
@@ -273,6 +236,7 @@ def handler(ctx, event):
             source_size_bytes=source_size,
             source_colorspace=detected_colorspace,
             processing_time_seconds=round(elapsed, 2),
+            mtime=s3_file_info.get("mtime", ""),
             vastdb_session=vastdb_session,
             ctx=ctx,
         )
@@ -292,9 +256,8 @@ def handler(ctx, event):
             dev_mode=dev_mode,
         )
 
-        io_mode = "NFS" if use_nfs else "S3"
         ctx.logger.info("=" * 80)
-        ctx.logger.info("PROXY GENERATION RESULTS (%s mode):", io_mode)
+        ctx.logger.info("PROXY GENERATION COMPLETE:")
         ctx.logger.info("  Source: s3://%s/%s (%d bytes)", s3_bucket, s3_key, source_size)
         ctx.logger.info("  Thumbnail: %s (%d bytes)", thumb_s3_key, thumb_size)
         ctx.logger.info("  Proxy: %s (%d bytes)", proxy_s3_key, proxy_size)
@@ -305,7 +268,6 @@ def handler(ctx, event):
 
         return {
             "status": "success",
-            "io_mode": io_mode,
             "asset_id": asset_id,
             "source_key": s3_key,
             "thumbnail_key": thumb_s3_key,
@@ -328,42 +290,18 @@ def handler(ctx, event):
         return _error_result(f"Proxy generation failed: {exc}")
 
     finally:
-        # Clean up temporary files (S3 mode only -- NFS outputs are permanent)
-        if _s3_downloaded and source_path and os.path.exists(source_path):
-            try:
-                os.unlink(source_path)
-            except OSError:
-                pass
-        if not use_nfs:
-            for path in [thumb_path, proxy_path]:
-                if path and os.path.exists(path):
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
-        # Clean up OCIO intermediate files (both modes)
-        if source_path:
-            for suffix in ["__sRGB.exr", "__Rec_709.exr"]:
-                intermediate = source_path.replace(".exr", suffix)
-                if os.path.exists(intermediate):
-                    try:
-                        os.unlink(intermediate)
-                    except OSError:
-                        pass
+        # Clean up ALL temporary files
+        for path in [source_path, thumb_path, proxy_path] + ocio_intermediates:
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _nfs_path(nfs_mount: str, bucket: str, key: str) -> str:
-    """Derive local NFS path from S3 bucket/key.
-
-    VAST exposes the same data via S3 and NFS. An object at
-    s3://bucket/path/file.exr is accessible at {NFS_MOUNT_PATH}/bucket/path/file.exr
-    """
-    return os.path.join(nfs_mount, bucket, key)
 
 
 def _is_supported_extension(s3_key: str) -> bool:
@@ -372,10 +310,7 @@ def _is_supported_extension(s3_key: str) -> bool:
 
 
 def _derive_asset_id(s3_key: str) -> str:
-    """Derive a stable asset ID from the S3 key.
-
-    Uses the filename without extension and frame number as the base.
-    """
+    """Derive a stable asset ID from the S3 key."""
     import hashlib
     return hashlib.md5(s3_key.encode()).hexdigest()[:16]
 
@@ -383,7 +318,8 @@ def _derive_asset_id(s3_key: str) -> str:
 def _derive_output_key(source_key: str, suffix: str) -> str:
     """Derive output S3 key from source key.
 
-    Example: renders/shot_010/beauty.0001.exr -> renders/shot_010/.proxies/beauty.0001_thumb.jpg
+    Example: renders/shot_010/beauty.0001.exr
+          -> renders/shot_010/.proxies/beauty.0001_thumb.jpg
     """
     parent = os.path.dirname(source_key)
     stem = os.path.splitext(os.path.basename(source_key))[0]
@@ -391,7 +327,7 @@ def _derive_output_key(source_key: str, suffix: str) -> str:
 
 
 def _download_from_s3(ctx, bucket: str, key: str) -> tuple:
-    """Download file from S3 to a temporary location. Returns (local_path, file_info)."""
+    """Download file from S3 to a temporary location."""
     if s3_client is None:
         raise RuntimeError("S3 client not initialized")
 
@@ -403,26 +339,46 @@ def _download_from_s3(ctx, bucket: str, key: str) -> tuple:
     ctx.logger.info("Downloading s3://%s/%s", bucket, key)
     s3_client.download_file(bucket, key, tmp_path)
 
-    # Get file size
     file_size = os.path.getsize(tmp_path)
 
-    # Get S3 metadata for mtime
+    # Get S3 metadata for mtime (used in file_id computation)
+    mtime = ""
     try:
         head = s3_client.head_object(Bucket=bucket, Key=key)
-        mtime = head.get("LastModified", "").isoformat() if head.get("LastModified") else ""
+        if head.get("LastModified"):
+            mtime = head["LastModified"].isoformat()
     except Exception:
-        mtime = ""
+        pass
 
     return tmp_path, {"size_bytes": file_size, "mtime": mtime}
 
 
-def _upload_to_s3(ctx, bucket: str, key: str, local_path: str) -> None:
-    """Upload a local file to S3."""
+def _upload_to_s3(ctx, bucket: str, key: str, local_path: str,
+                  media_type: str = "unknown") -> None:
+    """Upload a file to S3 with ContentType and tags for browser delivery."""
     if s3_client is None:
         ctx.logger.warning("S3 client not initialized, skipping upload")
         return
-    ctx.logger.info("Uploading to s3://%s/%s", bucket, key)
-    s3_client.upload_file(local_path, bucket, key)
+
+    # Set ContentType so browsers know how to handle presigned URL responses
+    if key.endswith(".jpg") or key.endswith(".jpeg"):
+        content_type = "image/jpeg"
+    elif key.endswith(".mp4"):
+        content_type = "video/mp4"
+    elif key.endswith(".png"):
+        content_type = "image/png"
+    else:
+        content_type = "application/octet-stream"
+
+    ctx.logger.info("Uploading s3://%s/%s (type=%s, content=%s)",
+                     bucket, key, media_type, content_type)
+    s3_client.upload_file(
+        local_path, bucket, key,
+        ExtraArgs={
+            "ContentType": content_type,
+            "Tagging": f"media_type={media_type}&generator=oiio-proxy-generator&version={__version__}",
+        },
+    )
 
 
 def _check_tool(name: str) -> bool:

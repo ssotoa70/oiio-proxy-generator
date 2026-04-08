@@ -1,3 +1,5 @@
 libopenimageio-dev
+openimageio-tools
 libopenexr-dev
+libopencolorio-dev
 ffmpeg
