@@ -33,8 +33,8 @@ except ImportError:
     vastdb = None
 
 DEFAULT_VASTDB_ENDPOINT = ""
-DEFAULT_VASTDB_BUCKET = os.environ.get("VAST_DB_BUCKET", "sergio-db")
-DEFAULT_SCHEMA_NAME = os.environ.get("VAST_DB_SCHEMA", "exr_metadata_2")
+DEFAULT_VASTDB_BUCKET = os.environ.get("VAST_DB_BUCKET", "")
+DEFAULT_SCHEMA_NAME = os.environ.get("VAST_DB_SCHEMA", "exr_metadata")
 DEFAULT_TABLE_NAME = "proxy_outputs"
 
 
@@ -174,7 +174,7 @@ def ensure_database_tables(session) -> None:
     """Ensure proxy_outputs table exists in VAST DataBase.
 
     Uses get-or-create pattern. Safe to call from multiple pods concurrently.
-    The schema (exr_metadata_2) is shared with exr-inspector -- this function
+    The schema is shared with exr-inspector (set via VAST_DB_SCHEMA) -- this function
     only creates the proxy_outputs table, leaving exr-inspector's tables untouched.
     """
     if pa is None or session is None:
