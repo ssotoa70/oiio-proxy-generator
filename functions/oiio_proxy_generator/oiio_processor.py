@@ -64,7 +64,7 @@ class OiioProcessor:
         if source_colorspace:
             cmd += ["--colorconvert", source_colorspace, "sRGB"]
         cmd += [
-            "--resize:filter=triangle", f"{thumb_width}x{thumb_height}",
+            "--fit:filter=triangle", f"{thumb_width}x{thumb_height}",
             "--compression", "jpeg:85",
             "-o", thumb_output,
             "--pop",
@@ -74,7 +74,7 @@ class OiioProcessor:
         if source_colorspace:
             cmd += ["--colorconvert", source_colorspace, "sRGB"]
         cmd += [
-            "--resize:filter=lanczos3", f"{proxy_width}x{proxy_height}",
+            "--fit:filter=lanczos3", f"{proxy_width}x{proxy_height}",
             "--compression", "jpeg:90",
             "-o", proxy_output,
         ]
