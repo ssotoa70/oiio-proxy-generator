@@ -165,15 +165,16 @@ def handler(ctx, event):
 
         # Single oiiotool invocation: read once, produce both outputs
         # Uses --dup/--pop stack ops, zero intermediates, one OCIO load
+        # Proxy size = min(source, 1920x1080) — never upscale
         processor = OiioProcessor()
-        processor.generate_both(
+        proxy_w, proxy_h = processor.generate_both(
             source=source_path,
             thumb_output=thumb_path,
             proxy_output=proxy_path,
             source_colorspace=source_colorspace,
         )
         ctx.logger.info("Thumbnail generated (%d bytes)", Path(thumb_path).stat().st_size)
-        ctx.logger.info("Proxy generated (%d bytes)", Path(proxy_path).stat().st_size)
+        ctx.logger.info("Proxy generated %dx%d (%d bytes)", proxy_w, proxy_h, Path(proxy_path).stat().st_size)
 
         thumb_size = Path(thumb_path).stat().st_size
         proxy_size = Path(proxy_path).stat().st_size
@@ -200,6 +201,7 @@ def handler(ctx, event):
             source_colorspace=detected_colorspace,
             processing_time_seconds=round(elapsed, 2),
             mtime=s3_file_info.get("mtime", ""),
+            proxy_resolution=f"{proxy_w}x{proxy_h}",
             vastdb_session=vastdb_session,
             ctx=ctx,
         )

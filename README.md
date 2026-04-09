@@ -126,6 +126,30 @@ ORDER BY e.size_bytes DESC;
 
 For shared trigger configuration, see [DEPLOYMENT.md](docs/DEPLOYMENT.md#step-5-create-the-element-trigger).
 
+## Future Enhancements
+
+### Three-tier output (planned)
+
+Currently generates two outputs per file: thumbnail (256x256) + proxy (native or capped at 1920x1080).
+
+A future release will add a third output — full-resolution preview — for detailed inspection and QC workflows:
+
+| Output | Resolution | Use Case |
+|--------|-----------|----------|
+| Thumbnail | 256x256 | Grid views, asset browsers |
+| Proxy | 1920x1080 (or native if smaller) | Quick review, editorial playback |
+| Preview | Full source resolution | Detailed inspection, QC, pixel-level review |
+
+**Expected cost:** +15-20% processing time per file. The expensive EXR decode + colorconvert happens once; adding a third branch only costs resize + JPEG encode.
+
+**Storage impact:** Preview files will be significantly larger (~2-10MB for 4K sources) compared to the capped proxy (~100KB-500KB).
+
+### Other planned enhancements
+- Sequence detection and assembly (handled by future sequence-assembler function)
+- Middle-frame thumbnail for sequences (instead of per-frame)
+- Poster-frame override (user-designatable hero frame)
+- OCIO ACES config support for facility-specific color pipelines
+
 ## License
 
 [MIT](LICENSE)
