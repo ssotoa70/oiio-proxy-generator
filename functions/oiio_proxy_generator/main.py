@@ -134,7 +134,6 @@ def handler(ctx, event):
     source_path = None
     thumb_path = None
     proxy_path = None
-    ocio_intermediates = []
     try:
         start_time = time.monotonic()
         asset_id = _derive_asset_id(s3_key)
@@ -150,37 +149,31 @@ def handler(ctx, event):
         thumb_path = tempfile.mktemp(suffix="_thumb.jpg", prefix=f"{asset_id}_")
         proxy_path = tempfile.mktemp(suffix="_proxy.jpg", prefix=f"{asset_id}_")
 
-        processor = OiioProcessor()
+        # Determine source colorspace for transform
         ext = os.path.splitext(s3_key)[1].lower()
         needs_colorconvert = _needs_color_transform(ext, source_path)
 
+        # Detect source colorspace (for scene-referred formats)
+        source_colorspace = None
         if needs_colorconvert:
-            # Scene-referred: apply color transforms
             transform = OcioTransform(
                 config_path=os.environ.get("OCIO_CONFIG_PATH"),
                 dev_mode=dev_mode,
             )
+            source_colorspace = transform.detect_colorspace(source_path)
+            ctx.logger.info("Detected colorspace: %s", source_colorspace)
 
-            # Thumbnail: source -> sRGB -> resize
-            transformed_for_thumb = transform.apply(source_path, target_colorspace="sRGB")
-            if transformed_for_thumb != source_path:
-                ocio_intermediates.append(transformed_for_thumb)
-            processor.generate_thumbnail(transformed_for_thumb, thumb_path)
-            ctx.logger.info("Thumbnail generated (%d bytes)", Path(thumb_path).stat().st_size)
-
-            # Proxy: source -> Rec709 -> resize
-            transformed_for_proxy = transform.apply(source_path, target_colorspace="Rec709")
-            if transformed_for_proxy != source_path:
-                ocio_intermediates.append(transformed_for_proxy)
-            processor.generate_proxy(transformed_for_proxy, proxy_path)
-            ctx.logger.info("Proxy generated (%d bytes)", Path(proxy_path).stat().st_size)
-        else:
-            # Display-referred (PNG, JPEG, 8-bit TIFF): resize only
-            processor.generate_thumbnail(source_path, thumb_path)
-            ctx.logger.info("Thumbnail generated (%d bytes)", Path(thumb_path).stat().st_size)
-
-            processor.generate_proxy(source_path, proxy_path)
-            ctx.logger.info("Proxy generated (%d bytes)", Path(proxy_path).stat().st_size)
+        # Single oiiotool invocation: read once, produce both outputs
+        # Uses --dup/--pop stack ops, zero intermediates, one OCIO load
+        processor = OiioProcessor()
+        processor.generate_both(
+            source=source_path,
+            thumb_output=thumb_path,
+            proxy_output=proxy_path,
+            source_colorspace=source_colorspace,
+        )
+        ctx.logger.info("Thumbnail generated (%d bytes)", Path(thumb_path).stat().st_size)
+        ctx.logger.info("Proxy generated (%d bytes)", Path(proxy_path).stat().st_size)
 
         thumb_size = Path(thumb_path).stat().st_size
         proxy_size = Path(proxy_path).stat().st_size
@@ -192,13 +185,7 @@ def handler(ctx, event):
 
         elapsed = time.monotonic() - start_time
 
-        # Detect colorspace for metadata
-        detected_colorspace = "display-referred"
-        if needs_colorconvert:
-            try:
-                detected_colorspace = transform.detect_colorspace(source_path)
-            except Exception:
-                detected_colorspace = "unknown"
+        detected_colorspace = source_colorspace or "display-referred"
 
         # Persist to VastDB
         persistence_result = persist_proxy_to_vast_database(
@@ -265,7 +252,7 @@ def handler(ctx, event):
         return _error_result(f"Proxy generation failed: {exc}")
 
     finally:
-        for path in [source_path, thumb_path, proxy_path] + ocio_intermediates:
+        for path in [source_path, thumb_path, proxy_path]:
             if path and os.path.exists(path):
                 try:
                     os.unlink(path)
